@@ -1,0 +1,6 @@
+node_modules/
+Client/dist/
+.env
+.env.*
+!.env.example
+*.log

@@ -1,0 +1,23 @@
+{
+  "name": "video-chat-app",
+  "version": "2.0.0",
+  "description": "Anonymous, end-to-end encrypted video calls. No accounts, nothing stored.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "client": "npm --prefix Client run dev",
+    "build": "npm --prefix Client install && npm --prefix Client run build"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.19.2",
+    "helmet": "^8.0.0",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.3"
+  }
+}
