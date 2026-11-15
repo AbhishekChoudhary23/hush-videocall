@@ -62,6 +62,83 @@ app.use((req, res, next) => {
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+/*
+ * ICE servers for the browsers. STUN alone fails when either side is behind
+ * carrier-grade or symmetric NAT (most mobile data, many ISPs), so a TURN
+ * relay is offered when one is configured. TURN only ever sees DTLS-SRTP
+ * ciphertext. Provider API keys stay on the server; browsers receive
+ * short-lived credentials.
+ */
+const DEFAULT_ICE = [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }];
+const ICE_TTL = 24 * 60 * 60; // seconds a credential stays valid
+const ICE_CACHE_MS = 60 * 60 * 1000; // reuse a credential for at most 1 hour
+let iceCache = { servers: null, expires: 0 };
+
+// Browsers block port 53, and it only slows ICE gathering down.
+const dropPort53 = (servers) =>
+	servers.map((s) => ({
+		...s,
+		urls: [].concat(s.urls).filter((u) => !/:53(\?|$)/.test(u)),
+	}));
+
+async function fetchIceServers() {
+	const { TURN_KEY_ID, TURN_KEY_API_TOKEN, METERED_DOMAIN, METERED_API_KEY, ICE_SERVERS } = process.env;
+	if (TURN_KEY_ID && TURN_KEY_API_TOKEN) {
+		const res = await fetch(
+			`https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(TURN_KEY_ID)}/credentials/generate-ice-servers`,
+			{
+				method: "POST",
+				headers: { Authorization: `Bearer ${TURN_KEY_API_TOKEN}`, "Content-Type": "application/json" },
+				body: JSON.stringify({ ttl: ICE_TTL }),
+				signal: AbortSignal.timeout(5000),
+			}
+		);
+		if (!res.ok) throw new Error(`Cloudflare TURN responded ${res.status}`);
+		const body = await res.json();
+		const servers = Array.isArray(body.iceServers) ? body.iceServers : [body.iceServers];
+		return dropPort53(servers.filter(Boolean));
+	}
+	if (METERED_DOMAIN && METERED_API_KEY) {
+		const res = await fetch(
+			`https://${METERED_DOMAIN}/api/v1/turn/credentials?apiKey=${encodeURIComponent(METERED_API_KEY)}`,
+			{ signal: AbortSignal.timeout(5000) }
+		);
+		if (!res.ok) throw new Error(`Metered TURN responded ${res.status}`);
+		const servers = await res.json();
+		if (!Array.isArray(servers)) throw new Error("Metered TURN returned an unexpected body");
+		return dropPort53(servers);
+	}
+	if (ICE_SERVERS) {
+		const servers = JSON.parse(ICE_SERVERS);
+		if (Array.isArray(servers)) return servers;
+	}
+	return null;
+}
+
+const iceLimiter = new Map(); // ip -> { count, reset }
+app.get("/api/ice", async (req, res) => {
+	res.setHeader("Cache-Control", "no-store");
+	const ip = requestIp(req);
+	const now = Date.now();
+	const entry = iceLimiter.get(ip);
+	if (entry && entry.reset > now && entry.count >= 30) return res.status(429).json({ iceServers: DEFAULT_ICE });
+	if (!entry || entry.reset <= now) iceLimiter.set(ip, { count: 1, reset: now + 60_000 });
+	else entry.count++;
+	if (iceLimiter.size > 10_000) iceLimiter.clear();
+
+	if (!iceCache.servers || iceCache.expires <= now) {
+		try {
+			const servers = await fetchIceServers();
+			iceCache = { servers: servers || DEFAULT_ICE, expires: now + ICE_CACHE_MS };
+		} catch (err) {
+			console.error("Could not get TURN credentials:", err.message);
+			// Retry soon rather than serving STUN-only for a whole hour.
+			iceCache = { servers: DEFAULT_ICE, expires: now + 30_000 };
+		}
+	}
+	res.json({ iceServers: iceCache.servers, relay: iceCache.servers !== DEFAULT_ICE });
+});
+
 // Serve the built client when it exists, so one process can host everything.
 const distDir = path.join(__dirname, "Client", "dist");
 if (fs.existsSync(path.join(distDir, "index.html"))) {
@@ -84,11 +161,26 @@ const rooms = new Map();
 const connections = new Map();
 
 function clientIp(socket) {
-	if (TRUST_PROXY) {
-		const xff = socket.handshake.headers["x-forwarded-for"];
-		if (typeof xff === "string" && xff.length) return xff.split(",").pop().trim();
-	}
-	return socket.handshake.address;
+	return proxiedIp(socket.handshake.headers) || socket.handshake.address;
+}
+
+function requestIp(req) {
+	return proxiedIp(req.headers) || req.socket.remoteAddress;
+}
+
+/**
+ * Behind Render (which fronts services with Cloudflare) the last
+ * X-Forwarded-For hop can be a shared proxy address, which would put many
+ * visitors into one rate-limit bucket. Cloudflare sets CF-Connecting-IP
+ * itself, so it is preferred when present.
+ */
+function proxiedIp(headers) {
+	if (!TRUST_PROXY) return null;
+	const cf = headers["cf-connecting-ip"] || headers["true-client-ip"];
+	if (typeof cf === "string" && cf) return cf.trim();
+	const xff = headers["x-forwarded-for"];
+	if (typeof xff === "string" && xff.length) return xff.split(",")[0].trim();
+	return null;
 }
 
 /** Token bucket: bursts up to `capacity`, refills `perSecond` tokens each second. */

@@ -19,7 +19,9 @@ import { deriveRoomKeys, seal, open } from "./crypto";
  */
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || undefined;
-const ICE_SERVERS = parseIceServers(import.meta.env.VITE_ICE_SERVERS);
+const STATIC_ICE = parseIceServers(import.meta.env.VITE_ICE_SERVERS);
+const ICE_REFRESH_MS = 30 * 60 * 1000;
+const FAILED_AFTER_MS = 20_000;
 
 const MAX_NAME = 32;
 const MAX_CHAT = 2000;
@@ -31,16 +33,19 @@ const UNVERIFIED_TIMEOUT = 30_000;
 const COLOR_RE = /^#[0-9a-f]{6}$/i;
 
 function parseIceServers(raw) {
-  if (raw) {
+  if (!raw) return null;
+  {
     try {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) return parsed;
     } catch {
-      console.warn("VITE_ICE_SERVERS is not valid JSON; using the default STUN server.");
+      console.warn("VITE_ICE_SERVERS is not valid JSON; ignoring it.");
     }
   }
-  return [{ urls: "stun:stun.l.google.com:19302" }];
+  return null;
 }
+
+const DEFAULT_ICE = [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }];
 
 export function cleanName(value) {
   if (typeof value !== "string") return "Guest";
@@ -66,6 +71,7 @@ export class RoomClient extends EventTarget {
 
   #keys = null;
   #socket = null;
+  #ice = { servers: STATIC_ICE || DEFAULT_ICE, fetched: 0 };
   #annoSession = null;
   #strokeSeq = 0;
 
@@ -90,9 +96,10 @@ export class RoomClient extends EventTarget {
     const socket = io(SERVER_URL, { transports: ["websocket", "polling"] });
     this.#socket = socket;
 
-    socket.on("connect", () => {
+    socket.on("connect", async () => {
       this.offline = false;
-      this.#join();
+      await this.#loadIce();
+      if (socket.connected && this.status !== "left") this.#join();
     });
     socket.on("connect_error", () => {
       this.offline = true;
@@ -107,7 +114,7 @@ export class RoomClient extends EventTarget {
       this.#update();
       if (reason === "io server disconnect") socket.connect();
     });
-    socket.on("peer-joined", ({ id }) => this.#addPeer(id));
+    socket.on("peer-joined", ({ id }) => this.#addPeer(id, false));
     socket.on("peer-left", ({ id }) => this.#removePeer(id));
     socket.on("locked", ({ locked }) => {
       this.locked = !!locked;
@@ -121,6 +128,24 @@ export class RoomClient extends EventTarget {
     });
   }
 
+  /**
+   * Gets STUN/TURN servers from our own server, which hands out short-lived
+   * TURN credentials. Without a relay, calls fail whenever either side is
+   * behind carrier-grade NAT, which is common on mobile data.
+   */
+  async #loadIce() {
+    if (STATIC_ICE || Date.now() - this.#ice.fetched < ICE_REFRESH_MS) return;
+    try {
+      const res = await fetch(`${SERVER_URL || ""}/api/ice`, { cache: "no-store" });
+      const body = await res.json();
+      if (Array.isArray(body?.iceServers) && body.iceServers.length) {
+        this.#ice = { servers: body.iceServers, fetched: Date.now() };
+      }
+    } catch {
+      /* keep the previous servers; STUN still works on simple networks */
+    }
+  }
+
   #join() {
     this.#socket.emit("join", { roomId: this.#keys.roomId }, (res) => {
       if (this.status === "left") return;
@@ -130,7 +155,7 @@ export class RoomClient extends EventTarget {
       this.maxSize = res.max || this.maxSize;
       this.status = "joined";
       this.error = null;
-      for (const id of res.peers) this.#addPeer(id);
+      for (const id of res.peers) this.#addPeer(id, true);
       this.#update();
     });
   }
@@ -166,16 +191,23 @@ export class RoomClient extends EventTarget {
     return [...this.peers.values()].filter((p) => p.verified);
   }
 
-  #addPeer(id) {
+  /**
+   * `initiator` is true for the newcomer. Only the newcomer sends the first
+   * offer; if both sides offered at once, the rollback that resolves the
+   * collision could leave ICE stuck with no candidates.
+   */
+  #addPeer(id, initiator) {
     if (typeof id !== "string" || id === this.selfId || this.peers.has(id)) return;
 
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const pc = new RTCPeerConnection({ iceServers: this.#ice.servers });
     const peer = {
       id,
       pc,
       dc: null,
       // Exactly one side of each pair is polite; it yields when offers collide.
       polite: this.selfId > id,
+      initiator,
+      deferredOffer: false,
       makingOffer: false,
       ignoreOffer: false,
       verified: false,
@@ -193,26 +225,30 @@ export class RoomClient extends EventTarget {
       inbox: Promise.resolve(),
       outbox: Promise.resolve(),
       timer: null,
+      failTimer: null,
+      failed: false,
     };
     this.peers.set(id, peer);
 
-    pc.onnegotiationneeded = async () => {
-      try {
-        peer.makingOffer = true;
-        await pc.setLocalDescription();
-        this.#signal(peer, { description: pc.localDescription.toJSON() });
-      } catch {
-        /* the connection was closed mid-negotiation */
-      } finally {
-        peer.makingOffer = false;
-      }
-    };
+    pc.onnegotiationneeded = () => this.#negotiate(peer);
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) this.#signal(peer, { candidate: candidate.toJSON() });
     };
     pc.onconnectionstatechange = () => {
-      peer.connState = pc.connectionState;
-      if (pc.connectionState === "failed") pc.restartIce();
+      const state = pc.connectionState;
+      peer.connState = state;
+      if (state === "connected") {
+        clearTimeout(peer.failTimer);
+        peer.failTimer = null;
+        if (peer.failed) {
+          peer.failed = false;
+          this.#toast(`Connected to ${peer.name}`);
+        }
+      } else if (state === "failed" || state === "disconnected") {
+        if (state === "failed") pc.restartIce();
+        // Give an ICE restart a chance before telling the user.
+        this.#armFailTimer(peer);
+      }
       this.#update();
     };
     pc.ontrack = ({ track, streams }) => {
@@ -250,6 +286,7 @@ export class RoomClient extends EventTarget {
     dc.onmessage = (ev) => this.#onData(peer, ev.data);
 
     this.#syncTracks(peer);
+    this.#armFailTimer(peer, FAILED_AFTER_MS + 10_000);
 
     // Someone who never proves they hold the code is dropped quietly.
     peer.timer = setTimeout(() => {
@@ -257,11 +294,43 @@ export class RoomClient extends EventTarget {
     }, UNVERIFIED_TIMEOUT);
   }
 
+  async #negotiate(peer) {
+    const { pc } = peer;
+    // Wait for the newcomer's first offer instead of racing it.
+    if (!peer.initiator && !pc.remoteDescription) {
+      peer.deferredOffer = true;
+      return;
+    }
+    try {
+      peer.makingOffer = true;
+      await pc.setLocalDescription();
+      this.#signal(peer, { description: pc.localDescription.toJSON() });
+    } catch {
+      /* the connection was closed mid-negotiation */
+    } finally {
+      peer.makingOffer = false;
+    }
+  }
+
+  /** Flags a peer that has not connected in time, so the UI can say so instead of spinning. */
+  #armFailTimer(peer, delay = FAILED_AFTER_MS) {
+    if (peer.failTimer || peer.failed) return;
+    peer.failTimer = setTimeout(() => {
+      peer.failTimer = null;
+      if (peer.pc.connectionState === "connected" || this.peers.get(peer.id) !== peer) return;
+      if (!peer.verified) return; // never proved the code; dropped silently elsewhere
+      peer.failed = true;
+      this.#toast(`Can't reach ${peer.name}. A network between you is blocking the call.`);
+      this.#update();
+    }, delay);
+  }
+
   #removePeer(id) {
     const peer = this.peers.get(id);
     if (!peer) return;
     this.peers.delete(id);
     clearTimeout(peer.timer);
+    clearTimeout(peer.failTimer);
     peer.pc.onnegotiationneeded = null;
     peer.pc.onicecandidate = null;
     peer.pc.onconnectionstatechange = null;
@@ -289,7 +358,7 @@ export class RoomClient extends EventTarget {
       .then(async () => {
         const data = await seal(
           this.#keys.signalKey,
-          { n: ++peer.sendSeq, ...payload },
+          { n: ++peer.sendSeq, name: this.name, ...payload },
           this.#context(selfId, peer.id)
         );
         if (this.peers.get(peer.id) === peer) this.#socket.emit("signal", { to: peer.id, data });
@@ -309,6 +378,8 @@ export class RoomClient extends EventTarget {
     peer.recvSeq = msg.n;
     if (!peer.verified) {
       peer.verified = true;
+      // The name also arrives here, so it shows even if the direct link never forms.
+      if (!peer.greeted) peer.name = cleanName(msg.name);
       this.#update();
     }
 
@@ -326,6 +397,11 @@ export class RoomClient extends EventTarget {
         if (description.type === "offer") {
           await pc.setLocalDescription();
           this.#signal(peer, { description: pc.localDescription.toJSON() });
+          // Send whatever we held back (our own tracks) now that the first exchange is done.
+          if (peer.deferredOffer) {
+            peer.deferredOffer = false;
+            this.#negotiate(peer);
+          }
         }
       } else if (candidate && typeof candidate === "object") {
         try {

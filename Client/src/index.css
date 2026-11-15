@@ -584,6 +584,10 @@ a {
   white-space: nowrap;
 }
 
+.tile-failed {
+  color: #ffb4b4;
+}
+
 .invite-card {
   display: grid;
   align-content: center;

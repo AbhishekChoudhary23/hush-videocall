@@ -6,7 +6,7 @@ import { hueFor, initials } from "../lib/util";
  * One participant. The <video> stays mounted even while the camera is off,
  * because it is also what plays that person's audio.
  */
-export default function VideoTile({ stream, name, label, self = false, audioOn, videoOn, connecting = false }) {
+export default function VideoTile({ stream, name, label, self = false, audioOn, videoOn, connecting = false, failed = false }) {
   const ref = useRef(null);
 
   useEffect(() => {
@@ -31,6 +31,7 @@ export default function VideoTile({ stream, name, label, self = false, audioOn, 
         {!audioOn && <MicOff size={14} aria-label="Muted" />}
         <span>{label || name}</span>
         {connecting && <span className="tile-status">connecting…</span>}
+        {failed && <span className="tile-status tile-failed">can&apos;t connect</span>}
       </div>
     </div>
   );

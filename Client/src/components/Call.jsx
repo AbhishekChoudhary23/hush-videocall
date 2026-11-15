@@ -148,7 +148,8 @@ export default function Call({ client, media, onLeave }) {
           name={p.name}
           audioOn={p.state.audio}
           videoOn={p.state.video}
-          connecting={!p.open}
+          connecting={!p.open && !p.failed}
+          failed={p.failed}
         />
       ))}
     </>

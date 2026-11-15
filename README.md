@@ -62,7 +62,9 @@ payloads, rooms kept in memory only.
   server (Google) also sees your IP. To hide IPs from peers, configure a TURN server and force relay.
 - The server operator serves the app code. As with any web app, end-to-end encryption assumes the
   served JavaScript is honest.
-- No TURN server is configured by default, so calls can fail on some corporate or mobile networks.
+- **Configure a TURN relay** (see `.env.example`). Without one, calls fail whenever either person
+  is behind carrier-grade NAT, which covers most mobile data and many home ISPs. The relay only sees
+  encrypted media. When a peer cannot be reached, the app says so instead of waiting forever.
 - A network drop reconnects you as a new participant; a locked call will not let you back in until
   someone unlocks it.
 - Annotations are drawn on the in-app view of the shared screen, not on the sharer's actual desktop.
